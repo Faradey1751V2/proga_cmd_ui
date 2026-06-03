@@ -1,81 +1,1349 @@
-        if latest_version != current_version and update_url:
-            send_update_notification(f"Доступна новая версия: {latest_version}")
-            set_new_param()
-    except requests.exceptions.RequestException as e:
-       custom_messagebox_showerror("Ошибка", f"Не удалось проверить обновления: {e}", current_theme)
+import sys
+import os
+import ctypes
+import requests
+import customtkinter as ctk
+from functools import partial
+import winsound
+import datetime
+from colorama import init, Fore, Style
+import threading
+import subprocess
+import re
+import tkinter as tk  # Необходим для создания всплывающих окон (tooltip)
+from tkinter import messagebox
+from PIL import Image
+from customtkinter import CTkImage
+MULTI_SELECT_MODE = False
+ready_button = None
+checkbox_vars_global = []
+current_nav_idx = -1
 
-def check_for_updates_on_button():
-    """Проверка наличия обновлений при нажатии на кнопку"""
-    repo_owner = 'Faradey1751V2'
-    repo_name = 'proga_cmd_ui'
-    api_url = f'https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest'
-    current_theme = ctk.get_appearance_mode()
+def load_update_settings():
+    """Читает настройки обновлений из SETTINGS_FILE. Возвращает (check_startup, check_monthly, auto_update)"""
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        if not os.path.exists(SETTINGS_FILE):
+            return True, True, False
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        while len(lines) < 6:
+            lines.append("\n")
+        startup = lines[3].strip().lower() in ('1', 'true', 'yes')
+        monthly = lines[4].strip().lower() in ('1', 'true', 'yes')
+        auto = lines[5].strip().lower() in ('1', 'true', 'yes')
+        return startup, monthly, auto
+    except Exception as e:
+        print("Ошибка загрузки настроек обновлений:", e)
+        return True, True, False
+
+# Блокировка интерфейса во время обновления
+updating = False
+original_close_handler = None
+PATCH_DIR = r"C:\proga_cmd\TempPatches"
+
+def check_local_patch_queue():
+    if not os.path.exists(PATCH_DIR):
+        return False
+
+    files = [f for f in os.listdir(PATCH_DIR) if f.endswith(".exe")]
+
+    # Игнорируем полный релиз
+    files = [f for f in files if f != "full_update.exe"]
+
+    if not files:
+        return False
+
+    current_version = read_version(VERSION_FILE)
+    current_patch = extract_current_patch(current_version)
+
+    patch_files = []
+    for f in files:
+        num = extract_patch_number(f)
+        if num is not None:
+            patch_files.append((num, f))
+
+    if not patch_files:
+        return False
+
+    patch_files.sort(key=lambda x: x[0])
+
+    next_patch = None
+    for num, fname in patch_files:
+        if num > current_patch:
+            next_patch = fname
+            break
+
+    if not next_patch:
+        # Очищаем папку
+        try:
+            for f in files:
+                os.remove(os.path.join(PATCH_DIR, f))
+        except:
+            pass
+        return False
+
+    next_patch_path = os.path.join(PATCH_DIR, next_patch)
+
+    # Безопасный запуск с проверкой и удалением битого файла
+    try:
+        # Проверяем, является ли файл корректным EXE
+        if not is_valid_exe(next_patch_path):
+            raise OSError("Файл повреждён или не является EXE")
+
+        subprocess.Popen([next_patch_path, "-s2"])
+
+        # Если запуск прошёл успешно, удаляем файл и выходим
+        try:
+            os.remove(next_patch_path)
+        except:
+            pass
+        root.after(10, safe_exit)
+
+    except Exception as e:
+        # Ловим ошибку (WinError 193 и др.)
+        print(f"[PATCH] Ошибка при запуске локального патча: {e}")
+
+        # Удаляем битый файл, чтобы не пытаться снова
+        try:
+            os.remove(next_patch_path)
+            print(f"[PATCH] Битый файл {next_patch_path} удалён.")
+        except:
+            pass
+
+def get_patch_chain(current_version):
+    if "_patch_" in current_version:
+        base_version = current_version.split("_patch_")[0]
+    else:
+        base_version = current_version
+
+    current_patch = extract_current_patch(current_version)
+    print(f"[PATCH] Базовая версия: {base_version}, текущий патч: {current_patch}")
+
+    repo_owner = "Faradey1751V2"
+    repo_name = "proga_cmd_ui"
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases"
+
     try:
         response = requests.get(api_url)
         response.raise_for_status()
-        latest_release = response.json()
-        latest_version = latest_release["tag_name"]
-        latest_assets = latest_release["assets"]
+        releases = response.json()
+    except Exception as e:
+        print("[PATCH] Ошибка получения списка релизов:", e)
+        return []
+
+    patch_list = []
+
+    for rel in releases:
+        tag = rel["tag_name"]
+
+        if "_patch_" not in tag:
+            continue
+
+        base, patch_part = tag.split("_patch_")
+
+        if base != base_version:
+            continue
+
+        try:
+            patch_number = int(patch_part.replace("V-", ""))
+        except:
+            continue
+
+        if patch_number <= current_patch:
+            continue
+
+        # ВАЖНО: цикл должен быть внутри цикла по релизам
+        for asset in rel["assets"]:
+            name = asset["name"]
+
+            # Берём только патчи, а не полные версии
+            if "_patch_" not in name:
+                continue
+
+            if name.lower().endswith(".exe"):
+                patch_list.append({
+                    "filename": name,
+                    "url": asset["browser_download_url"],
+                    "patch_number": patch_number
+                })
+
+    patch_list.sort(key=lambda x: x["patch_number"])
+    return patch_list
+
+# ===== Блокировка интерфейса =====
+def disable_all_widgets():
+    """Рекурсивно отключает все виджеты, которые поддерживают state."""
+    for child in root.winfo_children():
+        _disable_recursive(child)
+
+def _disable_recursive(widget):
+    try:
+        if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkOptionMenu)):
+            widget.configure(state="disabled")
+    except:
+        pass
+    try:
+        for child in widget.winfo_children():
+            _disable_recursive(child)
+    except:
+        pass
+
+def enable_all_widgets():
+    """Включает обратно все виджеты."""
+    for child in root.winfo_children():
+        _enable_recursive(child)
+
+def _enable_recursive(widget):
+    try:
+        if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkOptionMenu)):
+            widget.configure(state="normal")
+    except:
+        pass
+    try:
+        for child in widget.winfo_children():
+            _enable_recursive(child)
+    except:
+        pass
+
+def lock_ui_for_update():
+    global updating, original_close_handler
+    updating = True
+    disable_all_widgets()
+    original_close_handler = root.protocol("WM_DELETE_WINDOW")
+    def block_close():
+        custom_messagebox_showinfo("Обновление", "Идёт загрузка обновления. Пожалуйста, подождите.", ctk.get_appearance_mode())
+    root.protocol("WM_DELETE_WINDOW", block_close)
+
+def unlock_ui_after_update():
+    global updating, original_close_handler
+    updating = False
+    enable_all_widgets()
+    if original_close_handler:
+        root.protocol("WM_DELETE_WINDOW", original_close_handler)
+        original_close_handler = None
+    enable_keyboard_nav_main(root, left_frame, frame)
+
+# ===== Проверка EXE и безопасный запуск =====
+def is_valid_exe(path):
+    if not os.path.exists(path) or os.path.getsize(path) < 2:
+        return False
+    with open(path, 'rb') as f:
+        return f.read(2) == b'MZ'
+
+def run_installer_safe(filepath, timeout=5):
+    if not is_valid_exe(filepath):
+        return False
+    try:
+        proc = subprocess.Popen([filepath, "-s2"])
+        try:
+            returncode = proc.wait(timeout=timeout)
+            return returncode == 0
+        except subprocess.TimeoutExpired:
+            return True  # работает — считаем успехом
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return False
+
+def download_with_progress(url, save_path, progress_callback=None):
+    try:
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", 0))
+
+        with open(save_path, "wb") as f:
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total > 0:
+                        percent = int(downloaded * 100 / total)
+                        root.after(0, progress_callback, percent)
+
+        if not is_valid_exe(save_path):
+            raise Exception("Скачанный файл повреждён (не является EXE)")
+
+    except Exception as e:
+        # Удаляем битый файл
+        try:
+            if os.path.exists(save_path):
+                os.remove(save_path)
+        except:
+            pass
+        raise e
+
+def update_button_progress(prefix, percent):
+    update_button.configure(text=f"{prefix} {percent}%")
+    update_button.update_idletasks()
+
+def update_process_button(url):
+    global updating
+    if updating:
+        return
+    save_path = os.path.join(PATCH_DIR, "full_update.exe")
+    os.makedirs(PATCH_DIR, exist_ok=True)
+
+    def attempt():
+        try:
+            root.after(0, lock_ui_for_update)
+            root.after(0, lambda: update_button.configure(text="Загрузка обновления..."))
+
+            download_with_progress(
+                url,
+                save_path,
+                lambda p: root.after(0, lambda: update_button_progress("Загрузка обновления...", p))
+            )
+
+            # Очистка старых патчей
+            for f in os.listdir(PATCH_DIR):
+                fp = os.path.join(PATCH_DIR, f)
+                if f.endswith(".exe") and f != "full_update.exe":
+                    os.remove(fp)
+
+            if run_installer_safe(save_path):
+                root.after(0, unlock_ui_after_update)
+                root.after(10, safe_exit)
+            else:
+                raise Exception("Установщик не запустился. Файл может быть повреждён.")
+
+        except Exception as e:
+            root.after(0, lambda: unlock_ui_after_update())
+            root.after(0, lambda: update_button.configure(text="Проверить обновления"))
+            root.after(0, lambda: custom_messagebox_showerror("Ошибка обновления", str(e), ctk.get_appearance_mode()))
+
+            if custom_messagebox_askyesno(
+                "Ошибка",
+                f"{str(e)}\n\nПопробовать скачать заново?",
+                ctk.get_appearance_mode()
+            ):
+                update_process_button(url)
+            else:
+                if os.path.exists(save_path):
+                    try:
+                        os.remove(save_path)
+                    except:
+                        pass
+
+    threading.Thread(target=attempt).start()
+
+def extract_patch_number(filename):
+    # пример: proga_cmd_V-10.8_patch_V-2.exe
+    if "_patch_" not in filename:
+        return None
+    try:
+        part = filename.split("_patch_")[1]  # V-2.exe
+        num = part.replace("V-", "").replace(".exe", "")
+        return int(num)
+    except:
+        return None
+
+def start_patch_update():
+    global updating
+    if updating:
+        return
+    os.makedirs(PATCH_DIR, exist_ok=True)
+    current_version = read_version(VERSION_FILE)
+    print("[PATCH] Ищу патчи для версии:", current_version)
+
+    def attempt():
+        try:
+            root.after(0, lock_ui_for_update)
+            root.after(0, lambda: update_button.configure(text="Скачивание патчей..."))
+
+            patch_list = get_patch_chain(current_version)
+            if not patch_list:
+                raise Exception("Нет доступных патчей.")
+
+            for patch in patch_list:
+                filename = patch["filename"]
+                url = patch["url"]
+                save_path = os.path.join(PATCH_DIR, filename)
+                download_with_progress(
+                    url,
+                    save_path,
+                    lambda p: root.after(0, lambda: update_button_progress("Загрузка патча...", p))
+                )
+
+            first_patch = patch_list[0]["filename"]
+            first_patch_path = os.path.join(PATCH_DIR, first_patch)
+
+            if run_installer_safe(first_patch_path):
+                root.after(0, unlock_ui_after_update)
+                root.after(10, safe_exit)
+            else:
+                raise Exception("Патч не запустился. Повреждённый файл.")
+
+        except Exception as e:
+            root.after(0, lambda: unlock_ui_after_update())
+            root.after(0, lambda: update_button.configure(text="Проверить обновления"))
+            root.after(0, lambda: custom_messagebox_showerror("Ошибка патча", str(e), ctk.get_appearance_mode()))
+
+            if custom_messagebox_askyesno(
+                "Ошибка",
+                f"{str(e)}\n\nПопробовать загрузить патчи заново?",
+                ctk.get_appearance_mode()
+            ):
+                start_patch_update()
+            else:
+                for f in os.listdir(PATCH_DIR):
+                    if f.endswith(".exe") and "patch" in f:
+                        try:
+                            os.remove(os.path.join(PATCH_DIR, f))
+                        except:
+                            pass
+
+    threading.Thread(target=attempt).start()
+
+# Константы
+DATA_DIR = "C:\\proga_cmd"
+BEEP_SOUND = os.path.join(DATA_DIR, "Data", "beep2.wav")
+VERSION_FILE = os.path.join(DATA_DIR, "version.txt")
+SETTINGS_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Local", "proga_cmd")
+SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.txt")
+SELECTED_CHOICE_FILE = "selected_choice.txt"
+SELECTED_QUEUE_FILE = os.path.join(SETTINGS_DIR, "selected_queue.txt")
+INSTALL_EXE_PATH = os.path.join(DATA_DIR, "install.exe")
+
+WINDOW_WIDTH = 800
+WINDOW_HEIGHT = 520
+LEFT_FRAME_WIDTH = 160
+BUTTON_HEIGHT = 30
+MENU_FRAME_WIDTH = 560
+MENU_FRAME_HEIGHT = 370
+BUTTON_PADY = 5
+LEFT_FRAME_PADX = 10
+LEFT_FRAME_PADY = 20
+MENU_FRAME_PADX = 0
+MENU_FRAME_PADY = 20
+
+def clear_console():
+    """Очистка консоли в зависимости от ОС"""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def clean_tooltip_text(text):
+    """Удаляет невидимые и неразрывные символы, мешающие отображению подсказок."""
+    # Неразрывный пробел (U+00A0) и другие пробельные артефакты
+    text = text.replace('\u00A0', ' ')
+    # Мягкий перенос
+    text = text.replace('\u00AD', '')
+    # Символы нулевой ширины: пробел, соединитель, неразрывный пробел нулевой ширины
+    for ch in ['\u200B', '\u200C', '\u200D', '\uFEFF']:
+        text = text.replace(ch, '')
+    # Удаляем управляющие символы (кроме обычных пробелов и переводов строк)
+    import unicodedata
+    cleaned = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        # Оставляем печатные символы, пробелы (Zs) и переводы строк
+        if cat[0] not in ('C', 'Zl', 'Zp'):  # исключаем управляющие
+            cleaned.append(ch)
+    return ''.join(cleaned).strip()
+
+def extract_menu_and_title(file_path, start_tag, stop_tag):
+    """Извлечение меню и заголовка из файла с поддержкой UTF-8 и cp1251"""
+    global MULTI_SELECT_MODE
+    MULTI_SELECT_MODE = False
+    
+    try:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='cp1251') as file:
+                lines = file.readlines()
+    except FileNotFoundError:
+        messagebox.showerror("Ошибка", f"Файл {file_path} не найден.")
+        return "Меню", [], None
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось открыть файл {file_path}: {e}")
+        return "Меню", [], None
+
+    start_index, end_index = None, None
+    title, sms_message = "Меню", None
+
+    for i, line in enumerate(lines):
+        if start_tag in line:
+            start_index = i + 1
+        elif stop_tag in line:
+            end_index = i
+            break
+        elif 'rem title' in line:
+            title = line.split('rem title', 1)[1].strip().replace('|', '\n')
+        elif 'rem sms' in line:
+            sms_message = line.split('rem sms', 1)[1].strip().replace('|', '\n')
+        elif 'rem multi_select' in line:
+            MULTI_SELECT_MODE = True
+
+    if start_index is not None and end_index is not None:
+        menu_lines = []
+        for line in lines[start_index:end_index]:
+            line = line.strip().replace('|', '\n')
+            if line.startswith('echo') and '. ' in line:
+                menu_lines.append(line.split('. ', 1)[1])
+        return title, menu_lines, sms_message
+    else:
+        return title, [], sms_message
+                                      
+def read_version(file_path):
+    """Чтение версии из файла"""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            return file.read().strip()
+    except FileNotFoundError:
+        return "Версия не найдена"
+
+def extract_current_patch(version):
+    # версия может быть:
+    # proga_cmd_V-10.8
+    # proga_cmd_V-10.8_patch_V-1
+    if "_patch_" not in version:
+        return 0
+    try:
+        part = version.split("_patch_")[1]  # V-1
+        return int(part.replace("V-", ""))
+    except:
+        return 0
+
+
+def on_button_click(choice, root):
+    """Обработка нажатия кнопки выбора пункта меню"""
+    global selected_choice
+    selected_choice = choice
+    if not is_sound_off():
+        try:
+            winsound.PlaySound(BEEP_SOUND, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось воспроизвести звук: {e}")
+    root.after(300, root.destroy)
+
+def is_sound_off():
+    """Проверяет, установлен ли параметр 'sound off' в файле настроек"""
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if len(lines) >= 2 and "sound off" in lines[1].lower():
+            return True
+        return False
+    except FileNotFoundError:
+        return False
+
+def set_always_on_top(window):
+    """Установка окна поверх других"""
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
+
+def remove_maximize_button(window):
+    """Удаление кнопки максимизации окна"""
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    current_style = ctypes.windll.user32.GetWindowLongW(hwnd, -16)
+    new_style = current_style & ~0x00010000  # WS_MAXIMIZEBOX
+    ctypes.windll.user32.SetWindowLongW(hwnd, -16, new_style)
+
+def save_theme_to_file(theme):
+    """Сохранение текущей темы в файл"""
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
+            lines = file.readlines()
+        if lines:
+            lines[0] = theme + "\n"
+        else:
+            lines.append(theme + "\n")
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as file:
+            file.writelines(lines)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось сохранить тему в файл настроек {e}")
+
+def load_theme_from_file():
+    """Загрузка темы из файла"""
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        if not os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                pass
+
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as file:
+            lines = file.readlines()
+            if lines:
+                theme = lines[0].strip()
+                if theme in ["Light", "Dark"]:
+                    ctk.set_appearance_mode(theme)
+                else:
+                    ctk.set_appearance_mode("Dark")
+            else:
+                ctk.set_appearance_mode("Dark")
+    except FileNotFoundError:
+        ctk.set_appearance_mode("Dark")
+
+def install_exe(exe_path):
+    """Запуск exe файла установщика"""
+    try:
+        os.system(f'"{exe_path}" /s2')
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Ошибка при запуске установщика: {e}")
+
+
+def set_new_param():
+    """Создает параметр new в файле настроек"""
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if len(lines) >= 3:
+            lines[2] = "new\n"
+        else:
+            while len(lines) < 3:
+                lines.append("\n")
+            lines[2] = "new\n"
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Ошибка при работе с файлом настроек: {e}")
+
+
+def delete_new_param():
+    """Удаляет параметр new из файла настроек"""
+    try:
+        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if len(lines) >= 3:
+            lines[2] = ""
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Ошибка при работе с файлом настроек: {e}")
+
+def load_selection_queue():
+    try:
+        if os.path.exists(SELECTED_QUEUE_FILE):
+            with open(SELECTED_QUEUE_FILE, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    return [int(x) for x in content.split('|') if x.strip()]
+    except:
+        pass
+    return []
+
+def save_selection_queue(queue):
+    try:
+        os.makedirs(SETTINGS_DIR, exist_ok=True)
+        with open(SELECTED_QUEUE_FILE, 'w', encoding='utf-8') as f:
+            f.write('|'.join(str(x) for x in queue))
+    except:
+        pass
+
+def clear_selection_queue():
+    try:
+        if os.path.exists(SELECTED_QUEUE_FILE):
+            os.remove(SELECTED_QUEUE_FILE)
+    except:
+        pass
+
+def process_queue():
+    """Проверяет очередь и если есть, записывает следующий пункт в selected_choice.txt"""
+    queue = load_selection_queue()
+    if queue:
+        next_choice = queue[0]
+        queue.pop(0)
+        if queue:
+            save_selection_queue(queue)
+        else:
+            clear_selection_queue()
+        # Записываем следующий пункт в файл
+        with open(SELECTED_CHOICE_FILE, "w", encoding='utf-8') as file:
+            file.write(str(next_choice))
+        return True
+    return False
+
+# ============================
+#  Определение патча
+# ============================
+
+def parse_release_tag(tag_name):
+    """
+    Возвращает:
+    - is_patch: True/False
+    - base_version: 'proga_cmd_V-10.8'
+    - patch_number: int или 0
+    """
+    if "_patch_" in tag_name:
+        base, patch_part = tag_name.split("_patch_")
+        try:
+            patch_number = int(patch_part.replace("V-", ""))
+        except:
+            patch_number = 0
+        return True, base, patch_number
+    else:
+        return False, tag_name, 0
+
+# ============================
+#  Проверка обновлений при запуске
+# ============================
+
+def check_for_updates_on_startup():
+    repo_owner = 'Faradey1751V2'
+    repo_name = 'proga_cmd_ui'
+    api_url = f'https://api.github.com/repos/{repo_owner}/{repo_name}/releases'
+
+    try:
+        response = requests.get(api_url, timeout=3)
+        response.raise_for_status()
+        releases = response.json()
+    except requests.exceptions.RequestException:
+        # --- НЕТ ИНТЕРНЕТА: тихо пропускаем ---
+        return
+
+    try:
         current_version = read_version(VERSION_FILE)
-        if latest_assets:
-           for asset in latest_assets:
-                if asset["name"].lower().endswith(".exe"):
-                 update_url = asset["browser_download_url"]
-                 break
-           else:
-               update_url = None
-        else:
-            update_url = None
-        if latest_version != current_version and update_url:
-             update_available = custom_messagebox_askyesno("Обновление доступно", f"Доступна новая версия: {latest_version}. Обновить?", current_theme)
-             if update_available:
-                   send_update_notification(f"Начало обновления до {latest_version}")
-                   update_button.configure(text="Загрузка обновления...")
-                   def update_process():
-                      type_text(f"\nЗагрузка установщика {latest_version}...\n", Fore.CYAN)
-                      download_update(update_url, INSTALL_EXE_PATH)
-                      type_text("Установщик загружен. Запуск...\n", Fore.GREEN)
-                      install_exe(INSTALL_EXE_PATH)
-                      os._exit(0)
-                   thread = threading.Thread(target=update_process)
-                   thread.start()
-             else:
-                  root.after(0,lambda: update_button.configure(text="Проверить обновления"))
-        else:
-            root.after(0,lambda: update_button.configure(text="Обновлений нет"))
-            delete_new_param()
 
-    except requests.exceptions.RequestException as e:
-        custom_messagebox_showerror("Ошибка", f"Не удалось проверить обновления: {e}", current_theme)
+        if "_patch_" in current_version:
+            current_base = current_version.split("_patch_")[0]
+        else:
+            current_base = current_version
 
-def send_update_notification(message):
-    """Отправка уведомления с помощью plyer"""
-    notification.notify(
-        title="Обновление",
-        message=message,
-        app_name="proga_cmd",
-        timeout=10
-    )
+        # --- 1. СНАЧАЛА ИЩЕМ ПОЛНЫЕ РЕЛИЗЫ ---
+        full_releases = [r for r in releases if "_patch_" not in r["tag_name"]]
+
+        if full_releases:
+            latest_full = full_releases[0]
+
+            # Если релиз новее текущей базы — показываем уведомление
+            if latest_full["tag_name"] != current_base:
+                update_button.configure(text="Доступно обновление!")
+                set_new_param()
+                return
+
+        # --- 2. ЕСЛИ РЕЛИЗ НЕ НУЖЕН — ИЩЕМ ПАТЧИ ---
+        patch_list = get_patch_chain(current_version)
+
+        if patch_list:
+            update_button.configure(text="Доступен патч!")
+            set_new_param()
+            return
+
+        # --- 3. ЕСЛИ НИЧЕГО НЕТ ---
+        delete_new_param()
+
+    except Exception as e:
+        # Любые другие ошибки — тихо игнорируем
+        print("[ERROR] Проверка обновлений при запуске:", e)
+
+# ============================
+#  Проверка обновлений по кнопке
+# ============================
+
+def check_for_updates_on_button():
+    repo_owner = 'Faradey1751V2'
+    repo_name = 'proga_cmd_ui'
+    api_url = f'https://api.github.com/repos/{repo_owner}/{repo_name}/releases'
+    current_theme = ctk.get_appearance_mode()
+
+    try:
+        response = requests.get(api_url, timeout=3)
+        response.raise_for_status()
+        releases = response.json()
+
+    except requests.exceptions.RequestException:
+        # --- НЕТ ИНТЕРНЕТА ---
+        update_button.configure(text="Нет соединения")
+        return
+
+    try:
+        current_version = read_version(VERSION_FILE)
+
+        if "_patch_" in current_version:
+            current_base = current_version.split("_patch_")[0]
+        else:
+            current_base = current_version
+
+        # --- 1. СНАЧАЛА ИЩЕМ ПОЛНЫЕ РЕЛИЗЫ ---
+        full_releases = [r for r in releases if "_patch_" not in r["tag_name"]]
+
+        if full_releases:
+            latest_full = full_releases[0]
+
+            if latest_full["tag_name"] != current_base:
+                update_button.configure(text="Доступно обновление!")
+
+                warning_text = (
+                    f"Доступно обновление: {latest_full['tag_name']}\n\n"
+                    "ВНИМАНИЕ!\n"
+                    "Если у вас установлен или запущен фикс загрузки,\n"
+                    "для корректного обновления необходимо:\n\n"
+                    "1. Удалить службу фикса.\n"
+                    "2. Перезагрузить компьютер.\n"
+                    "3. Только после этого запускать обновление.\n\n"
+                    "Продолжить установку?"
+                )
+
+                update_available = custom_messagebox_askyesno(
+                    "Доступно обновление",
+                    warning_text,
+                    current_theme
+                )
+
+                if update_available:
+                    update_button.configure(text="Загрузка обновления...")
+                    update_url = latest_full["assets"][0]["browser_download_url"]
+                    thread = threading.Thread(target=update_process_button, args=(update_url,))
+                    thread.start()
+                return
+
+        # --- 2. ЕСЛИ РЕЛИЗ НЕ НУЖЕН — ИЩЕМ ПАТЧИ ---
+        patch_list = get_patch_chain(current_version)
+
+        if patch_list:
+            next_patch = patch_list[0]
+            update_button.configure(text="Доступен патч!")
+
+            warning_text = (
+                f"Доступен патч V-{next_patch['patch_number']} для версии {current_base}.\n\n"
+                "ВНИМАНИЕ!\n"
+                "Если у вас установлен или запущен фикс загрузки,\n"
+                "для корректного обновления необходимо:\n\n"
+                "1. Удалить службу фикса.\n"
+                "2. Перезагрузить компьютер.\n"
+                "3. Только после этого запускать обновление.\n\n"
+                "После установки всех патчей рекомендуется повторно проверить наличие обновлений,\n"
+                "так как может быть доступен новый релиз.\n\n"
+                "Продолжить установку?"
+            )
+
+            update_available = custom_messagebox_askyesno(
+                "Патч найден",
+                warning_text,
+                current_theme
+            )
+
+            if update_available:
+                update_button.configure(text="Загрузка патча...")
+                thread = threading.Thread(target=start_patch_update)
+                thread.start()
+            return
+
+        # --- 3. ЕСЛИ НИЧЕГО НЕТ ---
+        update_button.configure(text="Обновлений нет")
+        delete_new_param()
+
+    except Exception as e:
+        # Любые другие ошибки — тихо игнорируем
+        update_button.configure(text="Ошибка проверки")
+        print("[ERROR] Проверка обновлений:", e)
 
 def delayed_check_updates():
-    """Задержка перед проверкой обновлений"""
+    if updating:
+        return
     update_button.configure(text="Проверка...")
     root.after(2000, lambda: check_for_updates_on_button())
-
-
 def on_close(root):
-    """Обработка закрытия окна"""
-    with open(SELECTED_CHOICE_FILE, "w", encoding="utf-8") as file:
-        file.write("0")  # Записываем цифру 0 в файл
-    root.destroy()
-    os._exit(0)  # Закрываем весь процесс
+    """Корректное закрытие программы"""
+    try:
+        with open(SELECTED_CHOICE_FILE, "w", encoding="utf-8") as file:
+            file.write("0")
+    except:
+        pass
 
+    root.destroy()
+    os._exit(0)
+
+def safe_exit():
+    try:
+        root.destroy()
+    except:
+        pass
+    os._exit(0)
+
+# Инициализация colorama
+init(autoreset=True)
+
+# === Поиск кнопок ===
+def find_all_buttons(container):
+    """Рекурсивно ищет все CTkButton, CTkOptionMenu и CTkCheckBox внутри контейнера."""
+    buttons = []
+    for child in container.winfo_children():
+        if isinstance(child, (ctk.CTkButton, ctk.CTkOptionMenu, ctk.CTkCheckBox)):
+            buttons.append(child)
+        elif isinstance(child, (ctk.CTkFrame, ctk.CTkScrollableFrame)):
+            buttons.extend(find_all_buttons(child))
+    return buttons
+
+
+# === Гибкая установка цвета ===
+def _safe_configure_bg(widget, color):
+    if color is None:
+        return
+    try:
+        widget.configure(fg_color=color)
+        return
+    except Exception:
+        pass
+    for key in ('button_color', 'bg_color', 'background'):
+        try:
+            widget.configure(**{key: color})
+            return
+        except Exception:
+            pass
+
+
+def _smooth_scroll_to(canvas, target_fraction, steps=10, delay=15):
+    """Плавная прокрутка Canvas к позиции target_fraction (0..1)."""
+    start_fraction = canvas.yview()[0]
+    delta = (target_fraction - start_fraction) / steps
+
+    def step(i=0):
+        new_fraction = start_fraction + delta * i
+        canvas.yview_moveto(max(0, min(1, new_fraction)))
+        if i < steps:
+            canvas.after(delay, step, i + 1)
+
+    step()
+
+
+def _autoscroll_into_view(widget, idx=None, center=True):
+    try:
+        # Ищем ближайший CTkScrollableFrame
+        parent = widget.master
+        sf = None
+        while parent is not None:
+            if isinstance(parent, ctk.CTkScrollableFrame):
+                sf = parent
+                break
+            parent = parent.master
+        if sf is None:
+            return  # нет скролл-фрейма — прокрутка не нужна
+
+        # Универсальный способ получить Canvas
+        canvas = getattr(sf, "_canvas", None) \
+              or getattr(sf, "_parent_canvas", None)
+        if canvas is None:
+            print("[WARN] autoscroll: Canvas not found in CTkScrollableFrame")
+            return
+
+        sf.update_idletasks()
+        widget.update_idletasks()
+        canvas.update_idletasks()
+
+        sr = canvas.bbox("all")
+        if not sr:
+            return
+        total_height = sr[3] - sr[1]
+        if total_height <= 0:
+            return
+
+        view_top = int(canvas.canvasy(0))
+        view_bottom = view_top + canvas.winfo_height()
+
+        widget_top_in_window = widget.winfo_rooty() - canvas.winfo_rooty()
+        widget_top = canvas.canvasy(widget_top_in_window)
+        widget_bottom = widget_top + widget.winfo_height()
+
+        if idx == 0:
+            canvas.after_idle(lambda: _smooth_scroll_to(canvas, 0))
+            return
+
+        if center:
+            target_top = widget_top - (canvas.winfo_height() - widget.winfo_height()) / 2
+            target_fraction = max(0, min(1, target_top / total_height))
+            canvas.after_idle(lambda: _smooth_scroll_to(canvas, target_fraction))
+        else:
+            if widget_top < view_top:
+                target_fraction = max(0, min(1, widget_top / total_height))
+                canvas.after_idle(lambda: _smooth_scroll_to(canvas, target_fraction))
+            elif widget_bottom > view_bottom:
+                target_top = widget_bottom - canvas.winfo_height()
+                target_fraction = max(0, min(1, target_top / total_height))
+                canvas.after_idle(lambda: _smooth_scroll_to(canvas, target_fraction))
+    except Exception as e:
+        print("[WARN] autoscroll:", e)
+
+def highlight_widget_list(widgets, idx, original_colors, last_idx_ref):
+    """Сбрасывает цвета всех кнопок, подсвечивает текущую и автопрокручиваем."""
+    global current_nav_idx
+    current_nav_idx = idx
+
+    if not widgets:
+        return
+
+    # Сброс цвета и обводки у всех
+    for i, b in enumerate(widgets):
+        _safe_configure_bg(b, original_colors[i])
+        # Для чекбоксов убираем обводку
+        if isinstance(b, ctk.CTkCheckBox):
+            try:
+                b.configure(border_width=1)
+                b.configure(border_color="gray")
+            except:
+                pass
+
+    widget = widgets[idx]
+
+    # Автопрокрутка
+    _autoscroll_into_view(widget, idx, center=True)
+
+    try:
+        widget.focus_set()
+        # Показываем tooltip при фокусе
+        if hasattr(widget, 'tooltip'):
+            widget.tooltip.schedule()
+    except Exception:
+        try:
+            widget.focus()
+        except Exception:
+            pass
+
+    # Подсветка
+    if isinstance(widget, ctk.CTkCheckBox):
+        # Синяя обводка для чекбокса
+        try:
+            widget.configure(border_width=3)
+            widget.configure(border_color="#3B8ED0")
+        except:
+            pass
+    elif isinstance(widget, ctk.CTkButton):
+        # Для кнопок используем hover_color
+        hover_color = None
+        try:
+            hover_color = widget.cget("hover_color")
+        except Exception:
+            try:
+                hover_color = widgets[0].cget("hover_color")
+            except Exception:
+                hover_color = None
+
+        if hover_color:
+            _safe_configure_bg(widget, hover_color)
+    elif isinstance(widget, ctk.CTkOptionMenu):
+        # Для выпадающих меню тоже подсвечиваем
+        hover_color = None
+        try:
+            hover_color = widget.cget("button_hover_color")
+        except:
+            try:
+                hover_color = widget.cget("fg_color")
+            except:
+                hover_color = None
+        
+        if hover_color:
+            try:
+                widget.configure(fg_color=hover_color)
+            except:
+                pass
+
+    last_idx_ref[0] = idx
+
+# === Глобальное состояние ===
+left_buttons_global = []
+menu_buttons_global = []
+original_colors_left = []
+original_colors_menu = []
+nav_state = {"zone": "menu", "idx": 0}
+last_nav_zone = None
+last_nav_idx = None
+
+def clear_checkbox_highlight():
+    """Убирает обводку со всех чекбоксов"""
+    for cb in menu_buttons_global:
+        if isinstance(cb, ctk.CTkCheckBox):
+            try:
+                cb.configure(border_width=1)
+                cb.configure(border_color="gray")
+            except:
+                pass
+
+def highlight_current_main():
+    global last_nav_zone, last_nav_idx
+    if not (left_buttons_global or menu_buttons_global):
+        return
+
+    zone = nav_state.get("zone", "menu")
+    idx = nav_state.get("idx", 0)
+    arr = left_buttons_global if zone == "left" else menu_buttons_global
+    colors = original_colors_left if zone == "left" else original_colors_menu
+
+    # Сброс подсветки в другой зоне
+    if zone == "left" and menu_buttons_global:
+        for i, b in enumerate(menu_buttons_global):
+            _safe_configure_bg(b, original_colors_menu[i])
+    elif zone == "menu" and left_buttons_global:
+        for i, b in enumerate(left_buttons_global):
+            _safe_configure_bg(b, original_colors_left[i])
+
+    if last_nav_zone != zone:
+        last_nav_idx = None
+
+    highlight_widget_list(arr, idx, colors, [last_nav_idx])
+    last_nav_zone = zone
+
+# === Навигация главного окна ===
+def move_up_main(_=None):
+    nav_state["by_keyboard"] = True
+    arr = left_buttons_global if nav_state["zone"] == "left" else menu_buttons_global
+    if arr:
+        nav_state["idx"] = max(0, nav_state["idx"] - 1)
+        highlight_current_main()
+    return "break"
+
+def move_down_main(_=None):
+    nav_state["by_keyboard"] = True
+    arr = left_buttons_global if nav_state["zone"] == "left" else menu_buttons_global
+    if arr:
+        nav_state["idx"] = min(len(arr) - 1, nav_state["idx"] + 1)
+        highlight_current_main()
+    return "break"
+
+def move_left_main(_=None):
+    nav_state["by_keyboard"] = True
+    if nav_state["zone"] == "menu" and left_buttons_global:
+        nav_state["zone"] = "left"
+        nav_state["idx"] = min(nav_state["idx"], len(left_buttons_global) - 1)
+        highlight_current_main()
+        clear_checkbox_highlight()
+    return "break"
+
+def move_right_main(_=None):
+    nav_state["by_keyboard"] = True
+    if nav_state["zone"] == "left" and menu_buttons_global:
+        nav_state["zone"] = "menu"
+        nav_state["idx"] = min(nav_state["idx"], len(menu_buttons_global) - 1)
+        highlight_current_main()
+    return "break"
+
+def activate_current_main(_=None):
+    arr = left_buttons_global if nav_state["zone"] == "left" else menu_buttons_global
+    if arr:
+        widget = arr[nav_state["idx"]]
+        if isinstance(widget, ctk.CTkButton):
+            cmd = widget.cget("command")
+            if callable(cmd):
+                cmd()
+        elif isinstance(widget, ctk.CTkOptionMenu):
+            widget.focus_set()
+            try:
+                widget._open_dropdown_menu()
+            except Exception as e:
+                print("[WARN] OptionMenu open:", e)
+    return "break"
+
+def activate_checkbox(checkbox):
+    """Активирует чекбокс (переключает состояние)"""
+    var = checkbox.cget("variable")
+    if var:
+        var.set(not var.get())
+        # Обновляем кнопку "Готово"
+        update_ready_button()
+
+def enable_keyboard_nav_main(root, left_frame, menu_frame):
+    global left_buttons_global, menu_buttons_global
+    global original_colors_left, original_colors_menu, nav_state
+
+    for seq in ("<Up>", "<Down>", "<Left>", "<Right>", "<Return>", "<KP_Enter>"):
+        root.unbind_all(seq)
+
+    left_buttons_global = find_all_buttons(left_frame)
+    menu_buttons_global = find_all_buttons(menu_frame)
+    original_colors_left = [b.cget("fg_color") for b in left_buttons_global]
+    original_colors_menu = [b.cget("fg_color") for b in menu_buttons_global]
+
+    nav_state = {
+        "zone": "menu" if menu_buttons_global else "left",
+        "idx": 0,
+        "by_keyboard": False,
+        "activated": False
+    }
+
+    def move_up_main(_=None):
+        nav_state["by_keyboard"] = True
+        if not nav_state["activated"]:
+            nav_state["activated"] = True
+            nav_state["idx"] = 0
+        else:
+            arr = left_buttons_global if nav_state["zone"] == "left" else menu_buttons_global
+            if arr:
+                nav_state["idx"] = max(0, nav_state["idx"] - 1)
+        highlight_current_main()
+        return "break"
+
+    def move_down_main(_=None):
+        nav_state["by_keyboard"] = True
+        if not nav_state["activated"]:
+            nav_state["activated"] = True
+            nav_state["idx"] = 0
+        else:
+            arr = left_buttons_global if nav_state["zone"] == "left" else menu_buttons_global
+            if arr:
+                nav_state["idx"] = min(len(arr) - 1, nav_state["idx"] + 1)
+        highlight_current_main()
+        return "break"
+
+    def move_left_main(_=None):
+        nav_state["by_keyboard"] = True
+        if not nav_state["activated"]:
+            nav_state["activated"] = True
+            nav_state["idx"] = 0
+        elif nav_state["zone"] == "menu" and left_buttons_global:
+            nav_state["zone"] = "left"
+            nav_state["idx"] = min(nav_state["idx"], len(left_buttons_global) - 1)
+        highlight_current_main()
+        return "break"
+
+    def move_right_main(_=None):
+        nav_state["by_keyboard"] = True
+        if not nav_state["activated"]:
+            nav_state["activated"] = True
+            nav_state["idx"] = 0
+        elif nav_state["zone"] == "left" and menu_buttons_global:
+            nav_state["zone"] = "menu"
+            nav_state["idx"] = min(nav_state["idx"], len(menu_buttons_global) - 1)
+        highlight_current_main()
+        return "break"
+
+    def activate_current_main(_=None):
+        nav_state["by_keyboard"] = True
+        if not nav_state["activated"]:
+            nav_state["activated"] = True
+            nav_state["idx"] = 0
+            highlight_current_main()
+        arr = left_buttons_global if nav_state["zone"] == "left" else menu_buttons_global
+        if arr:
+            widget = arr[nav_state["idx"]]
+            if isinstance(widget, ctk.CTkButton):
+                cmd = widget.cget("command")
+                if callable(cmd):
+                    cmd()
+            elif isinstance(widget, ctk.CTkCheckBox):
+                # Для чекбокса - переключаем состояние
+                var = widget.cget("variable")
+                if var:
+                    var.set(not var.get())
+                    update_ready_button()
+            elif isinstance(widget, ctk.CTkOptionMenu):
+                widget.focus_set()
+                try:
+                    widget._open_dropdown_menu()
+                except Exception as e:
+                    print("[WARN] OptionMenu open:", e)
+        return "break"
+
+    # Привязка клавиш
+    root.bind_all("<Up>", move_up_main)
+    root.bind_all("<Down>", move_down_main)
+    root.bind_all("<Left>", move_left_main)
+    root.bind_all("<Right>", move_right_main)
+    root.bind_all("<Return>", activate_current_main)
+    root.bind_all("<KP_Enter>", activate_current_main)
+
+    # Сброс флага при клике мышкой
+    for b in left_buttons_global + menu_buttons_global:
+        b.bind("<Button-1>", lambda e: nav_state.update({"by_keyboard": False, "activated": False}))
+
+def enable_keyboard_nav_dialog(win):
+    buttons = find_all_buttons(win)
+    if not buttons:
+        return
+
+    state = {"idx": 0, "by_keyboard": False, "activated": False}
+    last_idx_ref = [None]
+    original = [b.cget("fg_color") for b in buttons]
+
+    def highlight():
+        if state.get("by_keyboard", False) and state.get("activated", False):
+            highlight_widget_list(buttons, state["idx"], original, last_idx_ref)
+        else:
+            # сброс на оригинальные цвета
+            for i, b in enumerate(buttons):
+                _safe_configure_bg(b, original[i])
+
+    def up(_=None):
+        state["by_keyboard"] = True
+        if not state["activated"]:
+            state["activated"] = True
+            state["idx"] = 0  # фиксируем первую кнопку
+        else:
+            state["idx"] = max(0, state["idx"] - 1)
+        highlight()
+        return "break"
+
+    def down(_=None):
+        state["by_keyboard"] = True
+        if not state["activated"]:
+            state["activated"] = True
+            state["idx"] = 0
+        else:
+            state["idx"] = min(len(buttons) - 1, state["idx"] + 1)
+        highlight()
+        return "break"
+
+    def left(_=None):
+        return up()
+
+    def right(_=None):
+        return down()
+
+    def activate(_=None):
+        state["by_keyboard"] = True
+        if not state["activated"]:
+            state["activated"] = True
+            state["idx"] = 0
+            highlight()
+        widget = buttons[state["idx"]]
+        if isinstance(widget, ctk.CTkButton):
+            cmd = widget.cget("command")
+            if callable(cmd):
+                cmd()
+        elif isinstance(widget, ctk.CTkOptionMenu):
+            widget.focus_set()
+            try:
+                widget._open_dropdown_menu()
+            except Exception as e:
+                print("[WARN] OptionMenu open:", e)
+        return "break"
+
+    # Привязка клавиш
+    win.bind("<Up>", up)
+    win.bind("<Down>", down)
+    win.bind("<Left>", left)
+    win.bind("<Right>", right)
+    win.bind("<Return>", activate)
+    win.bind("<KP_Enter>", activate)
+
+    # Сброс флага при клике мышкой
+    for b in buttons:
+        b.bind("<Button-1>", lambda e: state.update({"by_keyboard": False, "activated": False}))
+
+    # Первичная подсветку НЕ вызываем — кнопки остаются без подсветки
+
+
+# === Перехват создания CTkToplevel ===
+_original_toplevel = ctk.CTkToplevel
+def CTkToplevel_with_nav(*args, **kwargs):
+    global nav_locked
+    win = _original_toplevel(*args, **kwargs)
+    nav_locked = True
+
+    # Включаем навигацию для диалога чуть позже, чтобы кнопки успели отрисоваться
+    win.after(50, lambda: enable_keyboard_nav_dialog(win))
+
+    def on_close():
+        global nav_locked
+        nav_locked = False
+        def restore():
+            try:
+                if 'menu_frame_global' in globals() and 'left_frame_global' in globals():
+                    enable_keyboard_nav_main(root, left_frame_global, menu_frame_global)
+                    highlight_current_main()
+            finally:
+                win.destroy()
+        root.after(50, restore)
+
+    win.protocol('WM_DELETE_WINDOW', on_close)
+    return win
+
+ctk.CTkToplevel = CTkToplevel_with_nav
 
 def calculate_max_buttons(frame_height):
     """Вычисление максимального количества кнопок"""
     max_buttons = (frame_height - 170) // BUTTON_HEIGHT
     return max_buttons
-
 
 def create_menu_frame(root, menu_lines):
     """Создание фрейма для меню"""
@@ -87,63 +1355,374 @@ def create_menu_frame(root, menu_lines):
     frame.pack(fill="both", expand=True, padx=MENU_FRAME_PADX, pady=MENU_FRAME_PADY)
     return frame
 
+# ==== Новый класс Tooltip для отображения подсказки ====
+class CTkTooltip:
+    def __init__(self, widget, text, delay=1500, max_width=400):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.max_width = max_width
 
+        self.tipwindow = None
+        self.after_id = None
+
+        widget.bind("<Enter>", self.on_enter)
+        widget.bind("<Leave>", self.on_leave)
+        widget.bind("<ButtonPress>", self.on_leave)
+        widget.bind("<FocusIn>", self.on_enter)
+        widget.bind("<FocusOut>", self.on_leave)
+
+    def on_enter(self, event=None):
+        self.schedule()
+
+    def on_leave(self, event=None):
+        self.unschedule()
+        self.hide_tip()
+
+    def schedule(self):
+        self.unschedule()
+        self.after_id = self.widget.after(self.delay, self.show_tip)
+
+    def unschedule(self):
+        if self.after_id:
+            self.widget.after_cancel(self.after_id)
+            self.after_id = None
+
+    def show_tip(self, event=None):
+        if self.tipwindow or not self.text:
+            return
+
+        # финальная позиция
+        final_x = self.widget.winfo_rootx() + 20
+        final_y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+
+        # стартовая позиция (смещение вниз)
+        start_y = final_y + 8
+
+        # создаём окно
+        self.tipwindow = tw = ctk.CTkToplevel(self.widget)
+        tw.overrideredirect(True)
+        tw.attributes("-alpha", 0)
+
+        # цвета темы
+        dark = ctk.get_appearance_mode() == "Dark"
+        bg_color = "#343638" if dark else "#ECECEC"
+        text_color = "white" if dark else "black"
+
+        # внутренний фрейм
+        frame = ctk.CTkFrame(tw, fg_color=bg_color, corner_radius=0)
+        frame.pack(fill="both", expand=True)
+
+        # текст
+        label = ctk.CTkLabel(
+            frame,
+            text=self.text,
+            fg_color="transparent",
+            text_color=text_color,
+            font=("Tahoma", 12),
+            justify="left",
+            anchor="w",
+            wraplength=self.max_width - 20
+        )
+        label.pack(padx=8, pady=6)
+
+        tw.update_idletasks()
+
+        req_w = min(label.winfo_reqwidth() + 16, self.max_width)
+        req_h = label.winfo_reqheight() + 12
+
+        tw.geometry(f"{req_w}x{req_h}+{final_x}+{start_y}")
+
+        # анимация появления
+        self._animate_appear(tw, final_x, start_y, final_y)
+
+    def _animate_appear(self, window, x, current_y, final_y, step=2, alpha_step=0.1):
+        new_alpha = min(window.attributes("-alpha") + alpha_step, 1.0)
+        window.attributes("-alpha", new_alpha)
+
+        if current_y > final_y:
+            new_y = max(current_y - step, final_y)
+            window.geometry(f"+{x}+{new_y}")
+            window.after(15, lambda: self._animate_appear(window, x, new_y, final_y))
+        else:
+            window.attributes("-alpha", 1.0)
+
+    def hide_tip(self):
+        if self.tipwindow:
+            self._fade_out(self.tipwindow)
+
+    def _fade_out(self, window, current_alpha=1.0, step=0.1, delay=40):
+        new_alpha = current_alpha - step
+        if new_alpha <= 0:
+            window.attributes("-alpha", 0)
+            window.destroy()
+            self.tipwindow = None
+        else:
+            window.attributes("-alpha", new_alpha)
+            window.after(delay, lambda: self._fade_out(window, new_alpha, step, delay))
+
+# Модифицированная функция создания кнопок с поддержкой tooltip
 def create_buttons(frame, menu_lines, root):
-    """Создание кнопок меню"""
+
     buttons = []
+
+    frame.update_idletasks()
+    menu_width = frame.winfo_width()
+
     if not menu_lines:
         ctk.CTkLabel(frame, text="Нет пунктов меню").pack(pady=10)
         return buttons
 
     for index, item in enumerate(menu_lines, start=1):
-        button_text = f"{index}. {item}"
+        if "Назад" in item or "В меню" in item:
+            continue
+
+        # Извлекаем только текст подсказки
+        tooltip_text = None
+        groups = re.findall(r'\{(.+?)\}', item)
+        for grp in groups:
+            tooltip_text = clean_tooltip_text(grp)
+
+        visible_item = re.sub(r'\{.+?\}', '', item).strip()
+        button_text = f"{index}. {visible_item}"
+
         button = ctk.CTkButton(
             frame,
             text=button_text,
-            anchor="w",  # Выравнивание по левому краю
+            anchor="w",
             command=partial(on_button_click, index, root)
         )
         button.pack(fill='x', pady=BUTTON_PADY)
         buttons.append(button)
+
+        if tooltip_text:
+            CTkTooltip(
+                button,
+                tooltip_text,
+                delay=1500,
+                max_width=menu_width - 20
+            )
+
     return buttons
 
-def custom_messagebox_askyesno(title, message, theme):
-    """Создание пользовательского окна askyesno с темой."""
+def create_checkbox_buttons(frame, menu_lines, root):
+    """Создание кнопок с чекбоксами для множественного выбора"""
+    global selected_items, ready_button, checkbox_vars_global, current_nav_idx
+    selected_items = []
+    checkbox_vars_global = []
+    checkboxes = []
+    ready_button = None
+    
+    frame.update_idletasks()
+    menu_width = frame.winfo_width()
+    
+    # Удаляем старые кнопки навигации
+    for widget in left_frame.winfo_children():
+        if isinstance(widget, ctk.CTkButton) and widget.cget("text") in ["Назад", "В меню"]:
+            widget.destroy()
+    
+    # Находим индексы
+    back_index = None
+    menu_index = None
+    for i, item in enumerate(menu_lines, start=1):
+        if "Назад" in item:
+            back_index = i
+        elif "В меню" in item:
+            menu_index = i
+    
+    # Создаём кнопки в правильном порядке (сверху вниз при навигации):
+    # 1. Готово
+    # 2. Назад
+    # 3. В меню
+    
+    # Кнопка "Готово" (будет первой)
+    ready_button = ctk.CTkButton(
+        left_frame,
+        text="Готово",
+        fg_color="#CD9A1E",
+        hover_color="#B8860B",
+        width=LEFT_FRAME_WIDTH,
+        height=BUTTON_HEIGHT,
+        state="disabled",
+        command=None
+    )
+    ready_button.pack(pady=BUTTON_PADY, side="bottom")
+    
+    # Кнопка "Назад" (будет второй)
+    if back_index:
+        btn_back = ctk.CTkButton(
+            left_frame,
+            text="Назад",
+            width=LEFT_FRAME_WIDTH,
+            height=BUTTON_HEIGHT,
+            fg_color="#4CAF50",
+            hover_color="#388E3C",
+            command=lambda: on_button_click(back_index, root)
+        )
+        btn_back.pack(pady=BUTTON_PADY, side="bottom", before=ready_button)
+    
+    # Кнопка "В меню" (будет третьей)
+    if menu_index:
+        btn_menu = ctk.CTkButton(
+            left_frame,
+            text="В меню",
+            width=LEFT_FRAME_WIDTH,
+            height=BUTTON_HEIGHT,
+            fg_color="#B71C1C",
+            hover_color="#7F0000",
+            command=lambda: on_button_click(menu_index, root)
+        )
+        btn_menu.pack(pady=BUTTON_PADY, side="bottom", before=btn_back if back_index else ready_button)
+    
+    # Создаём чекбоксы
+    for index, item in enumerate(menu_lines, start=1):
+        if "Назад" in item or "В меню" in item:
+            continue
+        
+        tooltip_text = None
+        groups = re.findall(r'\{(.+?)\}', item)
+        for grp in groups:
+            tooltip_text = clean_tooltip_text(grp)
+        
+        visible_item = re.sub(r'\{.+?\}', '', item).strip()
+        
+        var = tk.BooleanVar(value=False)
+        checkbox_vars_global.append(var)
+        
+        var.trace_add('write', lambda *args: update_ready_button())
+        
+        cb = ctk.CTkCheckBox(
+            frame,
+            text=f"{index}. {visible_item}",
+            variable=var,
+            onvalue=True,
+            offvalue=False
+        )
+        
+        # Устанавливаем начальную тонкую серую обводку
+        try:
+            cb.configure(border_width=1)
+            cb.configure(border_color="gray")
+        except:
+            pass
+        
+        cb.pack(fill='x', pady=BUTTON_PADY)
+        
+        # Запоминаем индекс чекбокса
+        cb.index = len(checkboxes)
+        checkboxes.append(cb)
+        
+        # Наведение мыши
+        def on_enter(e, c=cb):
+            try:
+                c.configure(border_width=3)
+                c.configure(border_color="#3B8ED0")
+            except:
+                pass
+        
+        def on_leave(e, c=cb):
+            try:
+                if current_nav_idx != c.index:
+                    c.configure(border_width=1)
+                    c.configure(border_color="gray")
+            except:
+                pass
+        
+        cb.bind("<Enter>", on_enter)
+        cb.bind("<Leave>", on_leave)
+        
+        if tooltip_text:
+            CTkTooltip(cb, tooltip_text, delay=1500, max_width=menu_width - 20)
+    
+    return checkboxes
+
+def update_ready_button():
+    """Обновляет состояние кнопки Готово в зависимости от выбора"""
+    global ready_button, checkbox_vars_global
+    if ready_button:
+        any_selected = any(v.get() for v in checkbox_vars_global)
+        if any_selected:
+            ready_button.configure(state="normal", command=on_ready_click)
+        else:
+            ready_button.configure(state="disabled", command=None)
+
+def on_ready_click():
+    """Обработчик нажатия кнопки Готово"""
+    global checkbox_vars_global
+    selected = [i+1 for i, v in enumerate(checkbox_vars_global) if v.get()]
+    if selected:
+        if len(selected) > 1:
+            save_selection_queue(selected[1:])
+        with open(SELECTED_CHOICE_FILE, "w", encoding='utf-8') as f:
+            f.write(str(selected[0]))
+        safe_exit()
+    else:
+        custom_messagebox_showinfo("Множественный выбор", "Не выбран ни один пункт.", ctk.get_appearance_mode())
+
+def custom_messagebox_askyesno(title, message, theme, parent=None):
+    """Создание пользовательского окна askyesno с темой.
+    Если указан parent, диалог становится модальным относительно него."""
     result = None
-    dialog = ctk.CTkToplevel()
+    dialog = ctk.CTkToplevel(parent) if parent else ctk.CTkToplevel()
     dialog.title(title)
     dialog.resizable(False, False)
-    dialog.grab_set()  # Модальное окно
-    ctk.set_appearance_mode(theme)
     
-    label = ctk.CTkLabel(dialog, text=message, padx=20, pady=20)
+    # Привязываем к родителю и делаем модальным
+    if parent:
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.lift()
+    else:
+        dialog.grab_set()
+    
+    ctk.set_appearance_mode(theme)
+
+    label = ctk.CTkLabel(
+        dialog,
+        text=message,
+        padx=20,
+        pady=20,
+        justify="left",
+        anchor="w",
+        wraplength=400
+    )
     label.pack()
     dialog.update_idletasks()
     width = dialog.winfo_width()
     height = dialog.winfo_height()
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = (screen_width - width) // 2
-    y = (screen_height - height) // 2
+    
+    # Центрируем относительно родителя, если он есть, иначе относительно экрана
+    if parent:
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        x = parent_x + (parent_w - width) // 2
+        y = parent_y + (parent_h - height) // 2
+    else:
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
     dialog.geometry(f"+{x}+{y}")
 
     def on_yes():
-      nonlocal result
-      result = True
-      dialog.destroy()
+        nonlocal result
+        result = True
+        dialog.destroy()
 
     def on_no():
-      nonlocal result
-      result = False
-      dialog.destroy()
+        nonlocal result
+        result = False
+        dialog.destroy()
 
     yes_button = ctk.CTkButton(dialog, text="Да", command=on_yes)
     yes_button.pack(side="left", padx=10, pady=10)
 
     no_button = ctk.CTkButton(dialog, text="Нет", command=on_no)
     no_button.pack(side="right", padx=10, pady=10)
-    
-    dialog.wait_window()  # Ждать, пока окно не закроется
+
+    dialog.wait_window()
     return result
 
 def custom_messagebox_showinfo(title, message, theme):
@@ -151,9 +1730,9 @@ def custom_messagebox_showinfo(title, message, theme):
     dialog = ctk.CTkToplevel()
     dialog.title(title)
     dialog.resizable(False, False)
-    dialog.grab_set()  # Модальное окно
+    dialog.grab_set()
     ctk.set_appearance_mode(theme)
-    
+
     label = ctk.CTkLabel(dialog, text=message, padx=20, pady=20)
     label.pack()
     dialog.update_idletasks()
@@ -168,17 +1747,16 @@ def custom_messagebox_showinfo(title, message, theme):
     ok_button = ctk.CTkButton(dialog, text="OK", command=dialog.destroy)
     ok_button.pack(pady=10)
 
-    dialog.wait_window()  # Ждать, пока окно не закроется
-
+    dialog.wait_window()
 
 def custom_messagebox_showerror(title, message, theme):
     """Создание пользовательского окна showerror с темой."""
     dialog = ctk.CTkToplevel()
     dialog.title(title)
     dialog.resizable(False, False)
-    dialog.grab_set()  # Модальное окно
+    dialog.grab_set()
     ctk.set_appearance_mode(theme)
-    
+
     label = ctk.CTkLabel(dialog, text=message, padx=20, pady=20, text_color="red")
     label.pack()
     dialog.update_idletasks()
@@ -193,55 +1771,12 @@ def custom_messagebox_showerror(title, message, theme):
     ok_button = ctk.CTkButton(dialog, text="OK", command=dialog.destroy)
     ok_button.pack(pady=10)
 
-    dialog.wait_window()  # Ждать, пока окно не закроется
-
-def restart_pc(mode):
-    """Перезагрузка ПК с разными параметрами"""
-    current_theme = ctk.get_appearance_mode()
-    try:
-        if mode == "normal":
-            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК?", current_theme):
-                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
-        elif mode == "bios":
-            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в BIOS/UEFI?", current_theme):
-              subprocess.run(["shutdown", "/r", "/fw", "/t", "1"], check=True)
-        elif mode == "recovery":
-            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в среду восстановления?", current_theme):
-              subprocess.run(["shutdown", "/r", "/o"], check=True)
-        elif mode == "safe_min":
-           if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в минимальном безопасном режиме?", current_theme):
-              subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "minimal"], check=True)
-              subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
-        elif mode == "safe_net":
-           if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в безопасном режиме с сетью?", current_theme):
-              subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "network"], check=True)
-              subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
-        elif mode == "safe_alt":
-            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в альтернативном безопасном режиме?", current_theme):
-                subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "alternateshell"], check=True)
-                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
-        elif mode == "exit_safe":
-            try:
-                output = subprocess.check_output(["bcdedit", "/enum", "{current}"], encoding="utf-8")
-                if "safeboot" in output:
-                  if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите выйти из безопасного режима?", current_theme):
-                    subprocess.run(["bcdedit", "/deletevalue", "{current}", "safeboot"], check=True)
-                    subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
-                else:
-                   custom_messagebox_showinfo("Информация", "Этот пункт нужно использовать только тогда, когда вы находитесь в безопасном режиме.", current_theme)
-            except Exception as e:
-              custom_messagebox_showerror("Ошибка", f"Не удалось выполнить проверку безопасного режима: {e}", current_theme)
-    except subprocess.CalledProcessError as e:
-        custom_messagebox_showerror("Ошибка", f"Не удалось выполнить перезагрузку: {e}", current_theme)
-    except Exception as e:
-        custom_messagebox_showerror("Ошибка", f"Непредвиденная ошибка при выполнении перезагрузки: {e}", current_theme)
+    dialog.wait_window()
 
 def toggle_sound():
     """Переключает параметр sound off во второй строке файла настроек и меняет текст кнопки"""
     try:
-        # Создаем папку, если ее нет
         os.makedirs(SETTINGS_DIR, exist_ok=True)
-        # Создаем файл, если его нет
         if not os.path.exists(SETTINGS_FILE):
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 pass
@@ -272,146 +1807,920 @@ def toggle_sound():
     except (FileNotFoundError, IndexError) as e:
         messagebox.showerror("Ошибка", f"Ошибка при работе с файлом настроек: {e}")
 
-    update_sound_button_text()  # Обновляем текст кнопки сразу после изменения параметра
+    update_sound_button_text()
 
 def create_restart_menu(left_frame):
     """Создание меню для выбора режима перезагрузки"""
-    def restart_selected(choice_text):
-        index = [
-            "Перезагрузка",
-            "Перезагрузка в BIOS",
-            "Перезагрузка в среду восстановления",
-            "Безопасный режим (минимальный)",
-            "Безопасный режим (с сетью)",
-            "Безопасный режим (альтернативная оболочка)",
-            "Выйти из безопасного режима"
-        ].index(choice_text)
-        restart_pc(restart_options[index])
+    restart_map = {
+        "Перезагрузка": "normal",
+        "Перезагрузка по таймеру": "timer",
+        "Перезагрузка в BIOS": "bios",
+        "Перезагрузка в среду восстановления": "recovery",
+        "Безопасный режим (минимальный)": "safe_min",
+        "Безопасный режим (с сетью)": "safe_net",
+        "Безопасный режим (альтернативная оболочка)": "safe_alt",
+        "Выйти из безопасного режима": "exit_safe",
+    }
 
-    restart_options = ["normal", "bios", "recovery", "safe_min", "safe_net", "safe_alt", "exit_safe"]
-    restart_menu = ctk.CTkOptionMenu(left_frame,
-                                     values=[
-                                         "Перезагрузка",
-                                         "Перезагрузка в BIOS",
-                                         "Перезагрузка в среду восстановления",
-                                         "Безопасный режим (минимальный)",
-                                         "Безопасный режим (с сетью)",
-                                         "Безопасный режим (альтернативная оболочка)",
-                                         "Выйти из безопасного режима"
-                                     ],
-                                     width=LEFT_FRAME_WIDTH,
-                                     height=BUTTON_HEIGHT,
-                                     command=restart_selected)
+    def restart_selected(choice_text):
+        restart_menu.set("Перезагрузка ПК")
+        mode = restart_map[choice_text]
+        if mode == "timer":
+            open_universal_timer_dialog(left_frame, mode="restart")
+        else:
+            restart_pc(mode)
+
+    restart_menu = ctk.CTkOptionMenu(
+        left_frame,
+        values=list(restart_map.keys()),
+        width=LEFT_FRAME_WIDTH,
+        height=BUTTON_HEIGHT,
+        command=restart_selected
+    )
     restart_menu.set("Перезагрузка ПК")
     restart_menu.pack(pady=BUTTON_PADY)
 
-
-def update_sound_button_text():
-    """Обновляет текст кнопки звука при запуске программы"""
+def restart_pc(mode):
+    current_theme = ctk.get_appearance_mode()
     try:
-        # Создаем папку, если ее нет
-        os.makedirs(SETTINGS_DIR, exist_ok=True)
-        # Создаем файл, если его нет
-        if not os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                pass
+        if mode == "normal":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК?", current_theme):
+                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
+        elif mode == "bios":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в BIOS/UEFI?", current_theme):
+                subprocess.run(["shutdown", "/r", "/fw", "/t", "1"], check=True)
+        elif mode == "recovery":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в среду восстановления?", current_theme):
+                subprocess.run(["shutdown", "/r", "/o"], check=True)
+        elif mode == "safe_min":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в минимальном безопасном режиме?", current_theme):
+                subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "minimal"], check=True)
+                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
+        elif mode == "safe_net":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в безопасном режиме с сетью?", current_theme):
+                subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "network"], check=True)
+                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
+        elif mode == "safe_alt":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите перезагрузить ПК в альтернативном безопасном режиме?", current_theme):
+                subprocess.run(["bcdedit", "/set", "{current}", "safeboot", "alternateshell"], check=True)
+                subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
+        elif mode == "exit_safe":
+            try:
+                output = subprocess.check_output(
+    ["bcdedit", "/enum", "{current}"],
+    encoding="cp866",
+    errors="replace"
+)
+                if "safeboot" in output:
+                    if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите выйти из безопасного режима?", current_theme):
+                        subprocess.run(["bcdedit", "/deletevalue", "{current}", "safeboot"], check=True)
+                        subprocess.run(["shutdown", "/r", "/t", "0"], check=True)
+                else:
+                    custom_messagebox_showinfo("Информация", "Этот пункт нужно использовать только тогда, когда вы находитесь в безопасном режиме.", current_theme)
+            except Exception as e:
+                custom_messagebox_showerror("Ошибка", f"Не удалось выполнить проверку безопасного режима: {e}", current_theme)
+    except subprocess.CalledProcessError as e:
+        custom_messagebox_showerror("Ошибка", f"Не удалось выполнить перезагрузку: {e}", current_theme)
+    except Exception as e:
+        custom_messagebox_showerror("Ошибка", f"Непредвиденная ошибка при выполнении перезагрузки: {e}", current_theme)
 
-        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        if len(lines) >= 2 and "sound off" in lines[1].lower():
-            sound_button.configure(text="Включить звук")
+
+def create_shutdown_menu(left_frame):
+    """Меню для выбора режима выключения"""
+    shutdown_map = {
+        "Выключение ПК": "normal",
+        "Выключение по таймеру": "timer"
+    }
+
+    def shutdown_selected(choice_text):
+        shutdown_menu.set("Выключение ПК")
+        mode = shutdown_map[choice_text]
+        if mode == "timer":
+            open_universal_timer_dialog(left_frame, mode="shutdown")
         else:
-            sound_button.configure(text="Выключить звук")
+            shutdown_pc(mode)
 
-    except FileNotFoundError:
-        sound_button.configure(text="Выключить звук")
+    shutdown_menu = ctk.CTkOptionMenu(
+        left_frame,
+        values=list(shutdown_map.keys()),
+        width=LEFT_FRAME_WIDTH,
+        height=BUTTON_HEIGHT,
+        command=shutdown_selected
+    )
+    shutdown_menu.set("Выключение ПК")
+    shutdown_menu.pack(pady=BUTTON_PADY)
+
+    
+    return shutdown_menu
+
+def shutdown_pc(mode):
+    current_theme = ctk.get_appearance_mode()
+    try:
+        if mode == "normal":
+            if custom_messagebox_askyesno("Подтверждение", "Вы действительно хотите выключить ПК?", current_theme):
+                subprocess.run(["shutdown", "/s", "/t", "0"], check=True)
+    except subprocess.CalledProcessError as e:
+        custom_messagebox_showerror("Ошибка", f"Не удалось выполнить выключение: {e}", current_theme)
+    except Exception as e:
+        custom_messagebox_showerror("Ошибка", f"Непредвиденная ошибка: {e}", current_theme)
+
+def open_universal_timer_dialog(parent, mode="restart"):
+    """
+    mode: 'restart' или 'shutdown'
+    """
+    title = "Перезагрузка по таймеру" if mode == "restart" else "Выключение по таймеру"
+    cmd_flag = "/r" if mode == "restart" else "/s"
+
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title(title)
+    dialog.resizable(False, False)
+    center_window(dialog, 500, 200)
+    dialog.transient(parent.winfo_toplevel())
+    dialog.grab_set()
+
+    # Заголовки
+    ctk.CTkLabel(dialog, text="Часы").grid(row=0, column=0, padx=10, pady=(12, 6))
+    ctk.CTkLabel(dialog, text="Минуты").grid(row=0, column=1, padx=10, pady=(12, 6))
+    ctk.CTkLabel(dialog, text="Секунды").grid(row=0, column=2, padx=10, pady=(12, 6))
+
+    selected_hour = tk.StringVar(value="00")
+    selected_min  = tk.StringVar(value="00")
+    selected_sec  = tk.StringVar(value="00")
+
+    def create_arrow_selector(frame, min_val, max_val, var):
+        inner = ctk.CTkFrame(frame)
+        def increase():
+            cur = int(var.get())
+            if cur < max_val:
+                var.set(f"{cur + 1:02d}")
+        def decrease():
+            cur = int(var.get())
+            if cur > min_val:
+                var.set(f"{cur - 1:02d}")
+        up_btn = ctk.CTkButton(inner, text="▲", width=30, command=increase)
+        lbl = ctk.CTkLabel(inner, textvariable=var, width=40)
+        down_btn = ctk.CTkButton(inner, text="▼", width=30, command=decrease)
+        up_btn.grid(row=0, column=0, padx=5)
+        lbl.grid(row=0, column=1)
+        down_btn.grid(row=0, column=2, padx=5)
+        return inner
+
+    hour_selector = create_arrow_selector(dialog, 0, 23, selected_hour)
+    min_selector  = create_arrow_selector(dialog, 0, 59, selected_min)
+    sec_selector  = create_arrow_selector(dialog, 0, 59, selected_sec)
+
+    hour_selector.grid(row=2, column=0, padx=10, pady=6)
+    min_selector.grid(row=2, column=1, padx=10, pady=6)
+    sec_selector.grid(row=2, column=2, padx=10, pady=6)
+
+    def on_ok():
+        try:
+            h = int(selected_hour.get())
+            m = int(selected_min.get())
+            s = int(selected_sec.get())
+        except ValueError:
+            return
+
+        total = h * 3600 + m * 60 + s
+        if total <= 0:
+            return
+
+        # 1. Сначала отменяем любой существующий таймер (если есть)
+        subprocess.run(["shutdown", "/a"], capture_output=True)
+        # 2. Устанавливаем новый
+        subprocess.run(["shutdown", cmd_flag, "/t", str(total)], capture_output=True)
+
+        dialog.destroy()
+
+    def on_reset():
+        result = subprocess.run(["shutdown", "/a"], capture_output=True)
+        # Показываем окно с результатом
+        result_win = ctk.CTkToplevel(dialog)
+        result_win.title("Результат")
+        result_win.transient(dialog)
+        result_win.grab_set()
+        result_win.lift()
+        w, h_ = 300, 150
+        sw = result_win.winfo_screenwidth()
+        sh = result_win.winfo_screenheight()
+        result_win.geometry(f"{w}x{h_}+{(sw-w)//2}+{(sh-h_)//2}")
+
+        msg = "Нет активного таймера для отмены." if result.returncode != 0 else "Таймер отменён."
+        ctk.CTkLabel(result_win, text=msg, wraplength=280).pack(pady=20)
+        ctk.CTkButton(result_win, text="OK", command=result_win.destroy).pack(pady=10)
+        result_win.bind("<Escape>", lambda e: result_win.destroy())
+
+    def on_cancel():
+        dialog.destroy()
+
+    # Кнопки
+    ok_btn = ctk.CTkButton(dialog, text="Запустить таймер", command=on_ok)
+    reset_btn = ctk.CTkButton(dialog, text="Сбросить таймер", fg_color="gray30", hover_color="gray25", command=on_reset)
+    cancel_btn = ctk.CTkButton(dialog, text="Отмена", fg_color="gray30", hover_color="gray25", command=on_cancel)
+
+    ok_btn.grid(row=3, column=0, padx=10, pady=(10, 12), sticky="ew")
+    reset_btn.grid(row=3, column=1, padx=10, pady=(10, 12), sticky="ew")
+    cancel_btn.grid(row=3, column=2, padx=10, pady=(10, 12), sticky="ew")
+
+    dialog.columnconfigure(0, weight=1)
+    dialog.columnconfigure(1, weight=1)
+    dialog.columnconfigure(2, weight=1)
+
+def fade_in(win, duration=250, steps=20):
+    try:
+        win.attributes("-alpha", 0.0)
+    except Exception:
+        return
+    win.deiconify()
+    win.update_idletasks()
+    try:
+        win.wait_visibility()
+    except Exception:
+        pass
+
+    interval = max(1, duration // steps)
+
+    def _step(i=0):
+        alpha = min(1.0, i / steps)
+        win.attributes("-alpha", alpha)
+        if i < steps:
+            win.after(interval, _step, i + 1)
+
+    _step()
+
+def fade_out_and_destroy(win, duration=200, steps=18):
+    try:
+        start = float(win.attributes("-alpha"))
+    except Exception:
+        win.destroy()
+        return
+    interval = max(1, duration // steps)
+
+    def _step(i=0):
+        alpha = max(0.0, start * (1 - i / steps))
+        win.attributes("-alpha", alpha)
+        if i < steps:
+            win.after(interval, _step, i + 1)
+        else:
+            win.destroy()
+
+    _step()
+
+import webbrowser
+
+def open_mail():
+    """Показывает окно с email для связи (аналог open_donate)."""
+    dialog = ctk.CTkToplevel(root)
+    dialog.title("Написать автору")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.transient(root)
+
+    w, h = 400, 200
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    message = "Свяжитесь со мной по электронной почте:"
+    ctk.CTkLabel(dialog, text=message, font=("Helvetica", 14), justify="center", wraplength=360).pack(pady=(20, 10))
+
+    email = "proga_cmd@mail.ru"
+    email_label = ctk.CTkLabel(
+        dialog,
+        text=email,
+        font=("Helvetica", 18, "bold"),
+        text_color="#2E8B57",
+        justify="center"
+    )
+    email_label.pack(pady=10)
+
+    def copy_email():
+        dialog.clipboard_clear()
+        dialog.clipboard_append(email)
+        copy_btn.configure(text="Скопировано!", state="disabled")
+        dialog.after(1500, lambda: copy_btn.configure(text="Скопировать email", state="normal"))
+
+    copy_btn = ctk.CTkButton(dialog, text="Скопировать email", command=copy_email)
+    copy_btn.pack(pady=10)
+
+    ctk.CTkButton(dialog, text="Закрыть", command=dialog.destroy).pack(pady=5)
+    dialog.bind("<Return>", lambda e: dialog.destroy())
+
+def open_telegram():
+    """Открывает Telegram-канал в браузере."""
+    tg_url = "https://t.me/proga_cmd"
+    webbrowser.open(tg_url)
+
+def open_donate():
+    """Показывает окно с номером карты для поддержки."""
+    dialog = ctk.CTkToplevel(root)
+    dialog.title("Поддержать проект")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+    dialog.transient(root)
+
+    w, h = 400, 200   # высота уменьшена, т.к. нет QR
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    message = (
+        "Поддержать проект\n\n"
+        "Вы можете перевести любую сумму по номеру карты:"
+    )
+    label = ctk.CTkLabel(dialog, text=message, font=("Helvetica", 14), justify="center", wraplength=360)
+    label.pack(pady=(20, 10))
+
+    # Номер карты (замените на свой)
+    card_number = "2202 2082 7006 8878"
+    card_text = f"💳 Сбер: {card_number}"
+    ctk.CTkLabel(
+        dialog, 
+        text=card_text, 
+        font=("Helvetica", 18, "bold"),
+        text_color="#2E8B57",
+        justify="center"
+    ).pack(pady=10)
+
+    # Кнопка "Скопировать"
+    def copy_card():
+        dialog.clipboard_clear()
+        dialog.clipboard_append(card_number.replace(" ", ""))  # без пробелов
+        # можно добавить временное уведомление
+        copy_btn.configure(text="Скопировано!", state="disabled")
+        dialog.after(1500, lambda: copy_btn.configure(text="Скопировать", state="normal"))
+
+    copy_btn = ctk.CTkButton(dialog, text="Скопировать номер", command=copy_card)
+    copy_btn.pack(pady=10)
+
+    ok_btn = ctk.CTkButton(dialog, text="Закрыть", command=dialog.destroy)
+    ok_btn.pack(pady=5)
+
+    dialog.bind("<Return>", lambda e: dialog.destroy())
+
+def contact_action(choice):
+    if choice == "Написать на почту":
+        open_mail()
+    elif choice == "Telegram-канал":
+        open_telegram()
+    elif choice == "Поддержать проект":
+        open_donate()
+    contact_menu.set("Связь и поддержка")
+
+def open_settings_window():
+    settings_win = ctk.CTkToplevel(root)
+    settings_win.withdraw()
+    settings_win.title("Настройки")
+    settings_win.resizable(False, False)
+    settings_win.transient(root)
+
+    w, h = 460, 450
+    sw = settings_win.winfo_screenwidth()
+    sh = settings_win.winfo_screenheight()
+    x = (sw - w) // 2
+    y = (sh - h) // 2
+    settings_win.geometry(f"{w}x{h}+{x}+{y}")
+
+    current_theme = ctk.get_appearance_mode()
+    sound_on = not is_sound_off()
+    check_startup, check_monthly, auto_update = load_update_settings()
+
+    main_container = ctk.CTkFrame(settings_win, fg_color="transparent")
+    main_container.pack(fill="both", expand=True, padx=20, pady=20)
+
+    def make_switch_row(parent, left_icon, right_icon, initial_value, label_text, command=None):
+        row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        row_frame.pack(pady=(10, 0), fill="x")
+
+        inner = ctk.CTkFrame(row_frame, fg_color="transparent")
+        inner.pack(expand=True)
+
+        ctk.CTkLabel(inner, text=left_icon, font=("Helvetica", 24)).pack(side="left", padx=(0, 5))
+        var = tk.BooleanVar(value=initial_value)
+        switch = ctk.CTkSwitch(inner, text="", variable=var,
+                               onvalue=True, offvalue=False, width=50)
+        switch.pack(side="left", padx=5)
+        ctk.CTkLabel(inner, text=right_icon, font=("Helvetica", 24)).pack(side="left", padx=(5, 0))
+
+        ctk.CTkLabel(row_frame, text=label_text, font=("Helvetica", 12, "italic")).pack()
+
+        if command:
+            switch.configure(command=command)
+        return var
+
+    # --- Тема ---
+    theme_var = make_switch_row(main_container, "☀️", "🌙",
+                                current_theme == "Dark",
+                                "Оформление (светлая / тёмная)")
+
+    # --- Звук ---
+    def apply_sound(*args):
+        new_sound = sound_var.get()
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            if not os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                    pass
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            while len(lines) < 2:
+                lines.append("\n")
+            sound_off_now = (len(lines) >= 2 and "sound off" in lines[1].lower())
+
+            if new_sound and sound_off_now:
+                lines[1] = lines[1].replace("sound off", "").strip() + "\n"
+            elif not new_sound and not sound_off_now:
+                lines[1] = "sound off\n"
+
+            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+        except Exception as e:
+            print("Ошибка сохранения звука:", e)
+
+    sound_var = make_switch_row(main_container, "🔇", "🔊",
+                                sound_on,
+                                "Звук интерфейса",
+                                command=apply_sound)
+
+    # --- Обновления ---
+    startup_var = make_switch_row(main_container, "❌", "✅",
+                                  check_startup,
+                                  "Проверять обновления при запуске")
+    monthly_var = make_switch_row(main_container, "❌", "✅",
+                                  check_monthly,
+                                  "Проверять обновления 1 числа каждого месяца")
+    auto_var = make_switch_row(main_container, "❌", "✅",
+                               auto_update,
+                               "Автоматически загружать обновления")
+
+    def save_all_settings():
+        new_theme = "Dark" if theme_var.get() else "Light"
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            if not os.path.exists(SETTINGS_FILE):
+                lines = ["\n", "\n", "\n", "\n", "\n", "\n"]
+            else:
+                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+            while len(lines) < 6:
+                lines.append("\n")
+
+            lines[0] = new_theme + "\n"
+            lines[3] = "1\n" if startup_var.get() else "0\n"
+            lines[4] = "1\n" if monthly_var.get() else "0\n"
+            lines[5] = "1\n" if auto_var.get() else "0\n"
+
+            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+
+            if new_theme != current_theme:
+                ctk.set_appearance_mode(new_theme)
+        except Exception as e:
+            print("Ошибка сохранения настроек:", e)
+
+    def apply_and_close():
+        apply_sound()
+        save_all_settings()
+        settings_win.destroy()
+
+    # Крестик теперь только закрывает окно (без сохранения)
+    settings_win.protocol("WM_DELETE_WINDOW", settings_win.destroy)
+
+    ctk.CTkButton(settings_win, text="Закрыть и применить", command=apply_and_close,
+                  width=180, height=32).pack(pady=(15, 20))
+
+    settings_win.deiconify()
+    settings_win.grab_set()
+
+def show_info():
+    info_file_path = "C:\\proga_cmd\\info.txt"
+    ascii_art = """██████╗ ██████╗  ██████╗  ██████╗  █████╗          ██████╗███╗   ███╗██████╗ 
+██╔══██╗██╔══██╗██╔═══██╗██╔════╝ ██╔══██╗        ██╔════╝████╗ ████║██╔══██╗
+██████╔╝██████╔╝██║   ██║██║  ███╗███████║        ██║     ██╔████╔██║██║  ██║
+██╔═══╝ ██╔══██╗██║   ██║██║   ██║██╔══██║        ██║     ██║╚██╔╝██║██║  ██║
+██║     ██║  ██║╚██████╔╝╚██████╔╝██║  ██║███████╗╚██████╗██║ ╚═╝ ██║██████╔╝
+╚═╝     ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝     ╚═╝╚═════╝"""
 
 
-# Основной блок программы
+    # --- Парсим файл ---
+    def parse_sections(path):
+        sections = {}
+        current = "WELCOME"
+        sections[current] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("===") and line.endswith("===\n"):
+                    current = line.strip("=\n")
+                    sections[current] = []
+                else:
+                    sections[current].append(line)
+        return {k: "".join(v) for k, v in sections.items()}
+
+    try:
+        sections = parse_sections(info_file_path)
+    except Exception as e:
+        sections = {"ERROR": f"Не удалось открыть файл: {e}"}
+
+    # --- Создаём окно ---
+    info_window = ctk.CTkToplevel(root)
+    info_window.withdraw()  # сначала скрываем
+    info_window.title("Информация")
+
+    # --- Поверх основного окна ---
+    info_window.transient(root)
+    info_window.grab_set()
+    info_window.lift()
+    info_window.attributes('-topmost', True)
+    info_window.after(200, lambda: info_window.attributes('-topmost', False))
+
+    # --- Центрирование ---
+    window_width = 800
+    window_height = 500
+    screen_width = info_window.winfo_screenwidth()
+    screen_height = info_window.winfo_screenheight()
+    x = (screen_width - window_width) // 2
+    y = (screen_height - window_height) // 2
+    info_window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+    info_window.resizable(False, False)
+
+    # --- Основной текстовый блок ---
+    text_widget = ctk.CTkTextbox(info_window, wrap="word", font=("Courier New", 12))
+    text_widget.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def show_section(name):
+        text_widget.configure(state="normal")
+        text_widget.delete("1.0", "end")
+        if name == "WELCOME":
+            text_widget.insert("1.0", ascii_art + "\n\n" + sections.get("WELCOME", "👋 Добро пожаловать..."))
+        else:
+            text_widget.insert("1.0", sections.get(name, "Нет данных"))
+        text_widget.configure(state="disabled")
+
+    # --- Нижний фрейм с кнопками ---
+    bottom_frame = ctk.CTkFrame(info_window)
+    bottom_frame.pack(fill="x", pady=5)
+
+    ctk.CTkButton(bottom_frame, text="Приветствие", command=lambda: show_section("WELCOME")).pack(side="left", padx=5)
+    ctk.CTkButton(bottom_frame, text="Версия", command=lambda: show_section("VERSION")).pack(side="left", padx=5)
+    ctk.CTkButton(bottom_frame, text="FAQ", command=lambda: show_section("FAQ")).pack(side="left", padx=5)
+    ctk.CTkButton(bottom_frame, text="Инструкция", command=lambda: show_section("INSTRUCTION")).pack(side="left", padx=5)
+
+    # Кнопка закрытия в том же фрейме
+    ctk.CTkButton(bottom_frame, text="Закрыть",
+                  command=lambda: fade_out_and_destroy(info_window, 200, 18)).pack(side="right", padx=5)
+
+    # Инициализация приветствия
+    show_section("WELCOME")
+
+    # --- Плавное появление ---
+    fade_in(info_window, duration=250, steps=20)
+
+# Новости
+
+import feedparser, customtkinter as ctk, webview
+import tkinter as tk
+import threading
+
+def center_window(win, width=850, height=600):
+    screen_width = win.winfo_screenwidth()
+    screen_height = win.winfo_screenheight()
+    x = (screen_width // 2) - (width // 2)
+    y = (screen_height // 2) - (height // 2)
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.wm_attributes("-topmost", True)
+
+def center_webview(width=900, height=700):
+    tmp = tk.Tk()
+    screen_width = tmp.winfo_screenwidth()
+    screen_height = tmp.winfo_screenheight()
+    tmp.destroy()
+    x = (screen_width // 2) - (width // 2)
+    y = (screen_height // 2) - (height // 2)
+    return x, y
+
+class JSBridge:
+    def __init__(self, window):
+        self.window = window
+        self.ready_called = False
+
+    def mark_ready(self):
+        if not self.ready_called:
+            self.window.set_title("Статья загружена")
+            self.ready_called = True
+
+def show_news(news_button=None):
+    url = "https://news.google.com/rss/search?q=компьютеры+OR+операционные+системы+OR+Intel+OR+NVIDIA+OR+AMD&hl=ru&gl=RU&ceid=RU:ru"
+
+    try:
+        feed = feedparser.parse(url)
+
+        if not feed.entries:
+            raise ValueError("Нет доступных новостей или ошибка при загрузке RSS Проверте подключение к интренету или попробуйте через vpn.")
+
+        news_window = ctk.CTkToplevel(root)
+        news_window.title("Новости: Компьютеры, ОС, Intel, NVIDIA, AMD")
+        center_window(news_window, 850, 600)
+
+        scroll_frame = ctk.CTkScrollableFrame(news_window, width=820, height=580)
+        scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        for entry in feed.entries[:10]:
+            frame = ctk.CTkFrame(scroll_frame, corner_radius=8)
+            frame.pack(fill="x", pady=8, padx=5)
+
+            title_label = ctk.CTkLabel(frame, text=entry.title,
+                                       wraplength=780, justify="left",
+                                       font=("Helvetica", 14, "bold"))
+            title_label.pack(anchor="w", padx=10, pady=(5,2))
+
+            if hasattr(entry, "published"):
+                date_label = ctk.CTkLabel(frame, text=entry.published,
+                                          font=("Helvetica", 11, "italic"),
+                                          text_color="gray")
+                date_label.pack(anchor="w", padx=10)
+
+            read_button = ctk.CTkButton(frame, text="Читать",
+                                        command=lambda link=entry.link: open_article(link, news_window, news_button))
+            read_button.pack(anchor="e", padx=10, pady=5)
+
+    except Exception as e:
+        error_window = ctk.CTkToplevel(root)
+        error_window.title("Ошибка загрузки новостей")
+        center_window(error_window, 400, 200)
+
+        error_label = ctk.CTkLabel(error_window, text=f"Не удалось загрузить новости.\n{str(e)}",
+                                   wraplength=380, justify="center",
+                                   font=("Helvetica", 13), text_color="red")
+        error_label.pack(padx=20, pady=40)
+
+    finally:
+        if news_button:
+            news_button.configure(text="Новости")
+
+def open_article(link, news_window, news_button):
+    news_window.destroy()
+    x, y = center_webview(900, 700)
+    webview.settings['OPEN_EXTERNAL_LINKS_IN_BROWSER'] = False
+
+    theme = ctk.get_appearance_mode()
+
+    window = webview.create_window(
+        "Загружаем статью…",
+        link,
+        width=900,
+        height=700,
+        x=x,
+        y=y,
+        on_top=True,
+        js_api=None
+    )
+
+    bridge = JSBridge(window)
+    window.js_api = bridge
+
+    if theme == "Dark":
+        background = "rgba(30,30,30,0.95)"
+        text_color = "#eee"
+        spinner_color = "#00BFFF"
+        shadow = "1px 1px 2px rgba(0,0,0,0.6)"
+    else:
+        background = "rgba(240,240,240,0.95)"
+        text_color = "#222"
+        spinner_color = "#0078D7"
+        shadow = "1px 1px 2px rgba(255,255,255,0.6)"
+
+    js_code = f"""
+        const loader = document.createElement('div');
+        loader.id = 'custom-loader';
+        loader.style.position = 'fixed';
+        loader.style.top = '0';
+        loader.style.left = '0';
+        loader.style.width = '100%';
+        loader.style.height = '100%';
+        loader.style.background = '{background}';
+        loader.style.display = 'flex';
+        loader.style.flexDirection = 'column';
+        loader.style.alignItems = 'center';
+        loader.style.justifyContent = 'center';
+        loader.style.zIndex = '9999';
+
+        const spinner = document.createElement('div');
+        spinner.style.width = '50px';
+        spinner.style.height = '50px';
+        spinner.style.border = '6px solid #ccc';
+        spinner.style.borderTop = '6px solid {spinner_color}';
+        spinner.style.borderRadius = '50%';
+        spinner.style.animation = 'spin 1s linear infinite';
+
+        const text = document.createElement('div');
+        text.textContent = 'Загрузка статьи пожалуйста подождите...';
+        text.style.marginTop = '20px';
+        text.style.fontSize = '18px';
+        text.style.fontFamily = 'sans-serif';
+        text.style.color = '{text_color}';
+        text.style.textShadow = '{shadow}';
+        text.style.animation = 'blink 1.2s infinite';
+
+        const style = document.createElement('style');
+        style.appendChild(document.createTextNode(`
+            @keyframes spin {{
+                0% {{ transform: rotate(0deg); }}
+                100% {{ transform: rotate(360deg); }}
+            }}
+            @keyframes blink {{
+                0%, 100% {{ opacity: 1; }}
+                50% {{ opacity: 0.4; }}
+            }}
+        `));
+
+        loader.appendChild(spinner);
+        loader.appendChild(text);
+        document.body.appendChild(loader);
+        document.head.appendChild(style);
+
+        document.addEventListener('DOMContentLoaded', function() {{
+            const loader = document.getElementById('custom-loader');
+            if (loader) loader.remove();
+
+            if (window.pywebview && window.pywebview.api && window.pywebview.api.mark_ready) {{
+                window.pywebview.api.mark_ready();
+            }}
+        }});
+    """
+
+    def on_loaded():
+        try:
+            window.evaluate_js(js_code)
+        except Exception as e:
+            print("Ошибка JS:", e)
+
+        def fallback():
+            if not bridge.ready_called:
+                bridge.mark_ready()
+        threading.Timer(3.0, fallback).start()
+
+    # WebView запускается в главном потоке
+    webview.start(func=on_loaded, gui='tk', debug=False)
+
+def delayed_show_news(news_button):
+    news_button.configure(text="Загружаем…")
+    news_button.update_idletasks()
+    # Загружаем новости в отдельном потоке
+    threading.Thread(target=lambda: show_news(news_button)).start()
+
+def create_news_button(left_frame):
+    news_button = ctk.CTkButton(
+        left_frame,
+        text="Новости",
+        width=LEFT_FRAME_WIDTH,
+        height=BUTTON_HEIGHT,
+        command=lambda: delayed_show_news(news_button)
+    )
+    news_button.pack(pady=BUTTON_PADY)
+    return news_button
+
+# --- Добавляем кнопку "Информация" во фрейм ---
+def create_info_button(left_frame):
+    info_button = ctk.CTkButton(
+        left_frame,
+        text="Информация",
+        width=LEFT_FRAME_WIDTH,
+        height=BUTTON_HEIGHT,
+        command=show_info
+    )
+    info_button.pack(pady=BUTTON_PADY)
+    return info_button
+
+def create_side_nav_buttons(left_frame, root, menu_lines):
+
+    """Создаёт кнопки 'Назад' и 'В меню' и возвращает их список."""
+    buttons = []
+    NENO = False
+    back_index = None
+    menu_index = None
+    for i, item in enumerate(menu_lines, start=1):
+        if "Назад" in item: #назад
+            back_index = i #back_index
+        elif "В меню" in item: #В меню
+            menu_index = i #menu_index
+
+    if back_index:
+        btn_back = ctk.CTkButton(
+            left_frame,
+            text="Назад",
+            width=LEFT_FRAME_WIDTH,
+            height=BUTTON_HEIGHT,
+            fg_color="#4CAF50",
+            hover_color="#388E3C",
+            command=lambda: on_button_click(back_index, root)
+        )
+        btn_back.pack(pady=BUTTON_PADY, side="bottom") 
+        buttons.append(btn_back)
+        NENO = True
+
+    if menu_index:
+        btn_menu = ctk.CTkButton(
+            left_frame,
+            text="В меню",
+            width=LEFT_FRAME_WIDTH,
+            height=BUTTON_HEIGHT,
+            fg_color="#B71C1C",
+            hover_color="#7F0000",
+            command=lambda: on_button_click(menu_index, root)
+        )
+        btn_menu.pack(pady=BUTTON_PADY, side="bottom", before=btn_back if NENO else None)#, before=btn_back)
+        buttons.append(btn_menu)
+
+    return buttons
+
+# --- Основной блок программы ---
 if len(sys.argv) < 4:
     sys.exit(1)
 
 bat_file_path = sys.argv[1]
 start_tag = sys.argv[2]
 stop_tag = sys.argv[3]
-# Получаем текущий день месяца
 current_day = datetime.datetime.now().day
 
 clear_console()
+
+if process_queue():
+    sys.exit(0)
+
 title, menu_lines, sms_message = extract_menu_and_title(bat_file_path, start_tag, stop_tag)
 if not menu_lines:
     sys.exit(1)
 
 version = read_version(VERSION_FILE)
-# Загрузка темы из файла
 load_theme_from_file()
 ctk.set_default_color_theme("dark-blue")
 
 root = ctk.CTk()
 root.title(f"Версия программы {version}")
 
-# Получаем размеры экрана
 screen_width = root.winfo_screenwidth()
 screen_height = root.winfo_screenheight()
-
-# Вычисляем координаты для центрирования окна
 x = (screen_width - WINDOW_WIDTH) // 2
 y = (screen_height - WINDOW_HEIGHT) // 2
-
-# Устанавливаем положение окна
 root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
+root.resizable(False, False)
 
-root.resizable(False, False)  # Запрещаем изменение размеров окна
+root.lift()
+root.focus_force()
+root.attributes('-topmost', True)
+root.after(100, lambda: root.attributes('-topmost', False))
 
-# Создаем фрейм для кнопок слева
 left_frame = ctk.CTkFrame(root, width=LEFT_FRAME_WIDTH)
 left_frame.pack(side="left", fill="y", padx=LEFT_FRAME_PADX, pady=LEFT_FRAME_PADY)
+
 update_button = ctk.CTkButton(left_frame, text="Проверить обновления", width=LEFT_FRAME_WIDTH, height=BUTTON_HEIGHT,
-                             command=lambda: delayed_check_updates())
+                              command=lambda: delayed_check_updates())
 update_button.pack(pady=BUTTON_PADY)
 
-# Добавляем кнопку для переключения темы во фрейм слева
-theme_button = ctk.CTkButton(left_frame, text="Переключить тему", width=LEFT_FRAME_WIDTH, height=BUTTON_HEIGHT,
-                             command=toggle_theme)
-theme_button.pack(pady=BUTTON_PADY)
-
-# Добавляем кнопку для переключения звука
-sound_button = ctk.CTkButton(left_frame, text="", width=LEFT_FRAME_WIDTH, height=BUTTON_HEIGHT, command=toggle_sound)
-sound_button.pack(pady=BUTTON_PADY)
-# Создаем меню для перезагрузки
+settings_button = ctk.CTkButton(left_frame, text="Настройки", width=LEFT_FRAME_WIDTH, height=BUTTON_HEIGHT,
+                                command=open_settings_window)
+settings_button.pack(pady=BUTTON_PADY)
 create_restart_menu(left_frame)
+create_shutdown_menu(left_frame)
+news_button = create_news_button(left_frame)
+info_button = ctk.CTkButton(left_frame, text="Информация", width=LEFT_FRAME_WIDTH, height=BUTTON_HEIGHT, command=show_info)
+info_button.pack(pady=BUTTON_PADY)
+# Меню "Связь"
+contact_menu = ctk.CTkOptionMenu(
+    left_frame,
+    values=["Написать на почту", "Telegram-канал", "Поддержать проект"],  # добавили третий пункт
+    width=LEFT_FRAME_WIDTH,
+    height=BUTTON_HEIGHT,
+    command=contact_action,
+    anchor="center"
+)
+contact_menu.set("Связь и поддержка")
+contact_menu.pack(pady=BUTTON_PADY)
+side_buttons = create_side_nav_buttons(left_frame, root, menu_lines)
 
-# Установить окно поверх других и убрать кнопку максимизации
-set_always_on_top(root)
-remove_maximize_button(root)
-
-root.update_idletasks()
-
-# Создаем и настраиваем фрейм меню
 frame = create_menu_frame(root, menu_lines)
-
-# Используем Label для заголовка
 label_title = ctk.CTkLabel(frame, text=title, font=("Helvetica", 20, "bold"), justify="center")
 label_title.pack(pady=10)
 
-label_choice = ctk.CTkLabel(frame, text="Выберите пункт:", font=("Helvetica", 14))
-label_choice.pack(pady=5)
-
-# Используем Label для sms_message
 if sms_message:
     label_sms = ctk.CTkLabel(frame, text=sms_message, font=("Helvetica", 12, "italic"), justify="left")
     label_sms.pack(pady=5)
-else:
-    label_sms = None
 
-# Создаем кнопки меню
-buttons = create_buttons(frame, menu_lines, root)
+if MULTI_SELECT_MODE:
+    buttons = create_checkbox_buttons(frame, menu_lines, root)
+else:
+    buttons = create_buttons(frame, menu_lines, root)
+
+# Включаем навигацию для основного окна
+enable_keyboard_nav_main(root, left_frame, frame)
 
 root.protocol("WM_DELETE_WINDOW", lambda: on_close(root))
-
 selected_choice = None
-update_sound_button_text()
-# Проверка наличия new параметра в настройках
+
 try:
     with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
          lines = f.readlines()
@@ -419,12 +2728,11 @@ try:
        update_button.configure(text="Доступно обновление!")
 except FileNotFoundError:
      pass
-# Проверка обновлений только 1-го числа месяца при запуске
-if current_day == 1:
-   root.after(100, lambda: check_for_updates_on_startup())
 
+# Проверка локальных патчей после того, как окно создано
+root.after(100, check_local_patch_queue)
 
 root.mainloop()
 
-with open(SELECTED_CHOICE_FILE, "w", encoding="utf-8") as file:
+with open(SELECTED_CHOICE_FILE, "w", encoding='utf-8') as file:
     file.write(str(selected_choice) if selected_choice else "")
